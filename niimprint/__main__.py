@@ -97,9 +97,38 @@ from printer import TCPTransport, PrinterClient, SerialTransport
     # required=True,
     help="Domain to print",
 )
+@click.option(
+    "-p",
+    "--preview",
+    type=click.BOOL,
+    default=False,
+    show_default=True,
+    help="Preview barcode",
+)
+@click.option(
+    "-id",
+    "--include-id",
+    type=click.BOOL,
+    default=False,
+    show_default=True,
+    help="Include ID",
+)
 def print_cmd(
-    model, conn, addr, density, rotate, image, verbose, copies, barcode, domain
+    model,
+    conn,
+    addr,
+    density,
+    rotate,
+    image,
+    verbose,
+    copies,
+    barcode,
+    domain,
+    preview,
+    include_id,
 ):
+
+    print(include_id)
     logging.basicConfig(
         level="DEBUG" if verbose else "INFO",
         format="%(levelname)s | %(module)s:%(funcName)s:%(lineno)d - %(message)s",
@@ -131,9 +160,10 @@ def print_cmd(
         density = 3
 
     if barcode is not None:
-        image = generate_barcode_image(barcode, 40, 20, domain)
-        save_and_open_image(image)
-        click.confirm("Contin/ue printing?", abort=True)
+        image = generate_barcode_image(barcode, 40, 20, domain, include_id)
+        if preview:
+            save_and_open_image(image)
+            click.confirm("Contin/ue printing?", abort=True)
     else:
         image = Image.open(image)
 

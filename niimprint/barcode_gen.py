@@ -1,12 +1,11 @@
 from io import BytesIO
-from PIL import Image
+from PIL import Image, ImageOps
 import barcode
 from wand.image import Image as WandImage
 from wand.drawing import Drawing as WandDrawing
 from wand.color import Color
 from barcode.writer import ImageWriter
 import requests
-import json
 import os
 
 
@@ -16,24 +15,10 @@ def calculate_dimensions(label_width_mm, label_height_mm, pixels_per_mm=8):
     return width_px, height_px
 
 
-def calculate_padding(padding_mm, pixels_per_mm=8):
-    return {k: int(v * pixels_per_mm) for k, v in padding_mm.items()}
-
-
-def generate_barcode(barcode_text, available_width, barcode_height, font_path):
+def generate_barcode(barcode_text, available_width, barcode_height):
     barcode_class = barcode.get_barcode_class("code128")
     barcode_writer = ImageWriter()
-    barcode_writer.set_options(
-        {
-            "module_width": 1,
-            "module_height": 1,
-            "write_text": False,
-            "font_size": 0,
-            "text": "test",
-            "human": "test",
-            "font_path": font_path,
-        }
-    )
+    barcode_writer.set_options({})
     barcode_image = barcode_class(barcode_text, writer=barcode_writer)
     barcode_buffer = BytesIO()
     barcode_image.write(barcode_buffer, options={"write_text": False, "quiet_zone": 0})
@@ -41,40 +26,49 @@ def generate_barcode(barcode_text, available_width, barcode_height, font_path):
     return barcode_img.resize((available_width, barcode_height), Image.NEAREST)
 
 
-def render_text_with_wand(text, width_px, height_px, font_path, font_size, x, y):
-    with WandImage(
-        width=width_px, height=height_px, background=Color("transparent")
-    ) as text_layer:
+def render_text_with_wand(text, font_path, font_size):
+    with WandImage(width=1, height=1) as tmp_image:
         with WandDrawing() as draw:
             draw.font = font_path
             draw.font_size = font_size
             draw.fill_color = Color("black")
-            draw.resolution = (300, 300)
+            draw.resolution = (900, 900)
 
-            draw.text(x, y, text)
+            metrics = draw.get_font_metrics(tmp_image, text)
+            width = int(metrics.text_width)
+            height = int(metrics.text_height)
 
-            draw(text_layer)
+            with WandImage(
+                width=width, height=height, background=Color("transparent")
+            ) as text_layer:
+                draw.text(0, int(metrics.ascender), text)
+                draw(text_layer)
 
-        text_layer.format = "png"
-        text_layer.alpha_channel = "activate"
-        text_buffer = BytesIO(text_layer.make_blob("png"))
-        return Image.open(text_buffer).convert("RGBA")
+                text_layer.format = "png"
+                text_layer.alpha_channel = "activate"
+                text_buffer = BytesIO(text_layer.make_blob("png"))
+
+    return Image.open(text_buffer).convert("RGBA")
 
 
-def generate_barcode_image(barcode_text, label_width_mm, label_height_mm, domain):
+def generate_barcode_image(
+    barcode,
+    label_width_mm,
+    label_height_mm,
+    domain,
+    include_id=False,
+):
+    horizontal_offset = 12
+    vertical_offset = 5
+
     pixels_per_mm = 8
     width_px, height_px = calculate_dimensions(
         label_width_mm, label_height_mm, pixels_per_mm
     )
 
-    padding_mm = {"top": 2.2, "right": 2.3, "left": 2}
-    padding_px = calculate_padding(padding_mm, pixels_per_mm)
+    print(f"Label dimensions: {width_px}px x {height_px}px")
 
-    available_width = width_px - padding_px["left"] - padding_px["right"]
-
-    response = requests.get(
-        f"https://{domain}/api/purchase-order?barcode={barcode_text}"
-    )
+    response = requests.get(f"https://{domain}/api/purchase-order?barcode={barcode}")
 
     if response.status_code != 200:
         print(response.text)
@@ -89,6 +83,12 @@ def generate_barcode_image(barcode_text, label_width_mm, label_height_mm, domain
     plt_company_name_alb = data["pltCompany"]["nameAlb"]
     plt_company_location = data["pltCompany"]["location"]
     plt_company_location_alb = data["pltCompany"]["locationAlb"]
+    register_id = data["product"]["id"]
+
+    barcode_text = barcode
+
+    if include_id:
+        barcode_text += f" | {register_id}"
 
     product_data = [
         f"Артикл:  {product_name}",
@@ -100,48 +100,58 @@ def generate_barcode_image(barcode_text, label_width_mm, label_height_mm, domain
         f"Shtabi:  {plt_company_location_alb}",
     ]
 
-    # use local path
     path = os.path.dirname(os.path.abspath(__file__))
     font_path = f"{path}/fonts/HarmonyOS_Sans_Regular.ttf"
 
-    image = Image.new("RGBA", (width_px, height_px), color=(255, 255, 255, 255))
+    image = Image.new("RGB", (width_px, height_px), color=(255, 255, 255))
 
-    product_font_size = int(height_px * 0.080)
-    text_height = product_font_size
-    spacing = int(height_px * 0.01)
-    current_y = padding_px["top"]
+    product_font_size = int(height_px * 0.072)
+    spacing = int(height_px * 0.005)
+    current_y = 0
 
-    for i, text in enumerate(product_data):
-        text_pil = render_text_with_wand(
-            text,
-            width_px,
-            height_px,
-            font_path,
-            product_font_size,
-            padding_px["left"],
-            current_y,
-        )
-        image.paste(text_pil, (0, 0), text_pil)
+    for text in product_data:
+        text_image = render_text_with_wand(text, font_path, product_font_size)
+        text_width, text_height = text_image.size
+        image.paste(text_image, (0, current_y), text_image)
         current_y += text_height + spacing
 
     barcode_height = int(height_px * 0.30)
-    barcode_img = generate_barcode(
-        barcode_text, available_width, barcode_height, font_path
-    )
-    image.paste(barcode_img, (padding_px["left"], current_y - text_height))
+
+    barcode_width = width_px - horizontal_offset * 3
+    barcode_img = generate_barcode(barcode_text, barcode_width, barcode_height)
+
+    # Center the barcode horizontally
+    barcode_x = (width_px - barcode_img.width) // 2
+    image.paste(barcode_img, (0, current_y))
 
     barcode_font_size = int(height_px * 0.09)
+    barcode_text_image = render_text_with_wand(
+        barcode_text, font_path, barcode_font_size
+    )
+    barcode_text_width, barcode_text_height = barcode_text_image.size
+
+    # Center the barcode text below the barcode
+    barcode_text_x = (barcode_width - barcode_text_width) // 2
 
     barcode_text_y = current_y + barcode_height + spacing
-    barcode_text_pil = render_text_with_wand(
-        barcode_text,
-        width_px,
-        height_px,
-        font_path,
-        barcode_font_size,
-        padding_px["left"] + 105,
-        barcode_text_y,
+    image.paste(
+        barcode_text_image, (barcode_text_x, barcode_text_y), barcode_text_image
     )
-    image.paste(barcode_text_pil, (0, 0), barcode_text_pil)
+
+    # Apply horizontal offset
+    if horizontal_offset > 0:
+        image = ImageOps.expand(
+            image, border=(horizontal_offset, 0, 0, 0), fill=(255, 255, 255)
+        )
+    elif horizontal_offset < 0:
+        image = image.crop((-horizontal_offset, 0, image.width, image.height))
+
+    # Apply vertical offset
+    if vertical_offset > 0:
+        image = ImageOps.expand(
+            image, border=(0, vertical_offset, 0, 0), fill=(255, 255, 255)
+        )
+    elif vertical_offset < 0:
+        image = image.crop((0, -vertical_offset, image.width, image.height))
 
     return image
