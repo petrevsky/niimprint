@@ -69,7 +69,7 @@ class TCPTransport(BaseTransport):
     def __init__(self, host: str, port: int):
         print(host)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.settimeout(20)
+
         try:
             self._sock.connect((host, port))
         except Exception as e:
@@ -177,15 +177,16 @@ class PrinterClient:
         respcode = respoffset + reqcode
         packet = NiimbotPacket(reqcode, data)
         self._log_buffer("send", packet.to_bytes())
-        self._transport.write(packet.to_bytes())
 
-        resp = None
-        for _ in range(6):
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
+                self._transport.write(packet.to_bytes())
+
                 # Read header (4 bytes)
                 header = self._transport.read(4)
-                if header[:2] != b"\x55\x55":
-                    continue  # Not a valid packet start, try again
+                if len(header) != 4 or header[:2] != b"\x55\x55":
+                    raise ValueError(f"Invalid header: {header.hex()}")
 
                 data_length = header[3]
 
@@ -193,13 +194,18 @@ class PrinterClient:
                 rest_of_packet = self._transport.read(
                     data_length + 3
                 )  # data + checksum + AA AA
+                if len(rest_of_packet) != data_length + 3:
+                    raise ValueError(
+                        f"Incomplete packet: expected {data_length + 3} bytes, got {len(rest_of_packet)}"
+                    )
+
                 full_packet = header + rest_of_packet
 
                 try:
                     received_packet = NiimbotPacket.from_bytes(full_packet)
-                except AssertionError:
-                    print("Invalid packet received, retrying...")
-                    continue
+                except ValueError as e:
+                    logging.error(f"Error decoding packet: {full_packet.hex()}")
+                    raise
 
                 self._log_buffer("recv", full_packet)
 
@@ -208,15 +214,20 @@ class PrinterClient:
                 elif received_packet.type == 0:
                     raise NotImplementedError("Received unimplemented packet type")
                 elif received_packet.type == respcode:
-                    resp = received_packet
-                    return resp
-            except (ValueError, ConnectionError) as e:
-                print(f"Error reading packet: {e}")
+                    return received_packet
+                else:
+                    raise ValueError(
+                        f"Unexpected response code: {received_packet.type}, expected: {respcode}"
+                    )
 
-            time.sleep(0.1)
+            except (ValueError, ConnectionError, NotImplementedError) as e:
+                logging.warning(f"Attempt {attempt + 1}/{max_retries} failed: {str(e)}")
+                if attempt == max_retries - 1:
+                    logging.error("Max retries reached. Giving up.")
+                    return None
+                time.sleep(0.5)  # Wait before retrying
 
-        if not resp:
-            raise TimeoutError("No valid response received after 6 attempts")
+        return None  # This line should never be reached due to the return in the loop, but it's here for completeness
 
     def get_info(self, key):
         if packet := self._transceive(RequestCodeEnum.GET_INFO, bytes((key,)), key):
