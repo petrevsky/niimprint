@@ -118,7 +118,7 @@ def generate_barcode_image(
     barcode_height = int(height_px * 0.30)
 
     barcode_width = width_px - horizontal_offset * 3
-    barcode_img = generate_barcode(barcode_text, barcode_width, barcode_height)
+    barcode_img = generate_barcode(barcode, barcode_width, barcode_height)
 
     # Center the barcode horizontally
     barcode_x = (width_px - barcode_img.width) // 2
