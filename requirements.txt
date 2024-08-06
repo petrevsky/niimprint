@@ -1,3 +1,12 @@
+certifi==2024.7.4
+charset-normalizer==3.3.2
 click==8.1.7
-pillow==10.1.0
+idna==3.7
+numpy==2.0.1
+Pillow==10.1.0
+pycairo==1.26.1
 pyserial==3.5
+python-barcode==0.15.1
+requests==2.32.3
+urllib3==2.2.2
+Wand==0.6.13

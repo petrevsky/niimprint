@@ -7,10 +7,12 @@ import struct
 import time
 
 import serial
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw, ImageFont
+
 from serial.tools.list_ports import comports as list_comports
 
-from niimprint.packet import NiimbotPacket
+from dataclasses import dataclass
+from packet import NiimbotPacket
 
 
 class InfoEnum(enum.IntEnum):
@@ -42,6 +44,13 @@ class RequestCodeEnum(enum.IntEnum):
     GET_PRINT_STATUS = 163  # 0xA3
 
 
+@dataclass
+class PrintStatus:
+    finished: bool
+    progress: int
+    error: bool
+
+
 def _packet_to_int(x):
     return int.from_bytes(x.data, "big")
 
@@ -56,20 +65,33 @@ class BaseTransport(metaclass=abc.ABCMeta):
         raise NotImplementedError
 
 
-class BluetoothTransport(BaseTransport):
-    def __init__(self, address: str):
-        self._sock = socket.socket(
-            socket.AF_BLUETOOTH,
-            socket.SOCK_STREAM,
-            socket.BTPROTO_RFCOMM,
-        )
-        self._sock.connect((address, 1))
+class TCPTransport(BaseTransport):
+    def __init__(self, host: str, port: int):
+        print(host)
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._sock.settimeout(20)
+        try:
+            self._sock.connect((host, port))
+        except Exception as e:
+            print(f"Failed to connect to {host}:{port}: {e}")
+            raise
 
     def read(self, length: int) -> bytes:
-        return self._sock.recv(length)
+        data = b""
+        while len(data) < length:
+            chunk = self._sock.recv(length - len(data))
+            if not chunk:
+                raise ConnectionError("Connection closed while reading")
+            data += chunk
+        return data
 
     def write(self, data: bytes):
-        return self._sock.send(data)
+        total_sent = 0
+        while total_sent < len(data):
+            sent = self._sock.send(data[total_sent:])
+            if sent == 0:
+                raise ConnectionError("Connection closed while writing")
+            total_sent += sent
 
 
 class SerialTransport(BaseTransport):
@@ -100,18 +122,24 @@ class PrinterClient:
         self._transport = transport
         self._packetbuf = bytearray()
 
-    def print_image(self, image: Image, density: int = 3):
+    def print_image(self, image: Image, density: int = 3, copies: int = 1):
         self.set_label_density(density)
         self.set_label_type(1)
-        self.start_print()
+        self.start_print(copies)
         # self.allow_print_clear()  # Something unsupported in protocol decoding (B21)
         self.start_page_print()
-        self.set_dimension(image.height, image.width)
-        # self.set_quantity(1)  # Same thing (B21)
+        self.set_dimension(image.height, image.width, copies)
+        # self.set_quantity(2)  # Same thing (B21)
         for pkt in self._encode_image(image):
             self._send(pkt)
         self.end_page_print()
-        time.sleep(0.3)  # FIXME: Check get_print_status()
+        while True:
+            status = self.get_print_status()
+            if status.error:
+                raise RuntimeError("Failure during printing")
+            if status.finished:
+                break
+            logging.info(f"Printing.. {status.progress}%")
         while not self.end_print():
             time.sleep(0.1)
 
@@ -149,20 +177,46 @@ class PrinterClient:
         respcode = respoffset + reqcode
         packet = NiimbotPacket(reqcode, data)
         self._log_buffer("send", packet.to_bytes())
-        self._send(packet)
+        self._transport.write(packet.to_bytes())
+
         resp = None
         for _ in range(6):
-            for packet in self._recv():
-                if packet.type == 219:
-                    raise ValueError
-                elif packet.type == 0:
-                    raise NotImplementedError
-                elif packet.type == respcode:
-                    resp = packet
-            if resp:
-                return resp
+            try:
+                # Read header (4 bytes)
+                header = self._transport.read(4)
+                if header[:2] != b"\x55\x55":
+                    continue  # Not a valid packet start, try again
+
+                data_length = header[3]
+
+                # Read rest of the packet
+                rest_of_packet = self._transport.read(
+                    data_length + 3
+                )  # data + checksum + AA AA
+                full_packet = header + rest_of_packet
+
+                try:
+                    received_packet = NiimbotPacket.from_bytes(full_packet)
+                except AssertionError:
+                    print("Invalid packet received, retrying...")
+                    continue
+
+                self._log_buffer("recv", full_packet)
+
+                if received_packet.type == 219:
+                    raise ValueError("Received error packet")
+                elif received_packet.type == 0:
+                    raise NotImplementedError("Received unimplemented packet type")
+                elif received_packet.type == respcode:
+                    resp = received_packet
+                    return resp
+            except (ValueError, ConnectionError) as e:
+                print(f"Error reading packet: {e}")
+
             time.sleep(0.1)
-        return resp
+
+        if not resp:
+            raise TimeoutError("No valid response received after 6 attempts")
 
     def get_info(self, key):
         if packet := self._transceive(RequestCodeEnum.GET_INFO, bytes((key,)), key):
@@ -252,8 +306,13 @@ class PrinterClient:
         packet = self._transceive(RequestCodeEnum.SET_LABEL_DENSITY, bytes((n,)), 16)
         return bool(packet.data[0])
 
-    def start_print(self):
-        packet = self._transceive(RequestCodeEnum.START_PRINT, b"\x01")
+    def start_print(self, total_pages):
+        page_count_bytes = total_pages.to_bytes(2, byteorder="big")
+        remaining_bytes = b"\x00\x00\x00\x00\x00"
+
+        packet = self._transceive(
+            RequestCodeEnum.START_PRINT, page_count_bytes + remaining_bytes
+        )
         return bool(packet.data[0])
 
     def end_print(self):
@@ -272,9 +331,9 @@ class PrinterClient:
         packet = self._transceive(RequestCodeEnum.ALLOW_PRINT_CLEAR, b"\x01", 16)
         return bool(packet.data[0])
 
-    def set_dimension(self, w, h):
+    def set_dimension(self, w, h, copies):
         packet = self._transceive(
-            RequestCodeEnum.SET_DIMENSION, struct.pack(">HH", w, h)
+            RequestCodeEnum.SET_DIMENSION, struct.pack(">HHH", w, h, copies)
         )
         return bool(packet.data[0])
 
@@ -284,5 +343,7 @@ class PrinterClient:
 
     def get_print_status(self):
         packet = self._transceive(RequestCodeEnum.GET_PRINT_STATUS, b"\x01", 16)
-        page, progress1, progress2 = struct.unpack(">HBB", packet.data)
-        return {"page": page, "progress1": progress1, "progress2": progress2}
+        finished = bool(packet.data[1])
+        progress = packet.data[2]
+        error = bool(packet.data[6])
+        return PrintStatus(finished, progress, error)
