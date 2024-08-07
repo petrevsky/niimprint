@@ -132,16 +132,10 @@ class PrinterClient:
         # self.set_quantity(2)  # Same thing (B21)
         for pkt in self._encode_image(image):
             self._send(pkt)
+            time.sleep(0.01)
+
         self.end_page_print()
-        while True:
-            status = self.get_print_status()
-            if status.error:
-                raise RuntimeError("Failure during printing")
-            if status.finished:
-                break
-            logging.info(f"Printing.. {status.progress}%")
-        while not self.end_print():
-            time.sleep(0.1)
+        time.sleep(2)
 
     def _encode_image(self, image: Image):
         img = ImageOps.invert(image.convert("L")).convert("1")
@@ -318,11 +312,13 @@ class PrinterClient:
         return bool(packet.data[0])
 
     def start_print(self, total_pages):
-        page_count_bytes = total_pages.to_bytes(2, byteorder="big")
-        remaining_bytes = b"\x00\x00\x00\x00\x00"
+        assert (
+            0 <= total_pages <= 65535
+        )  # assume total_pages can not be greater than 65535 (2 bytes)
 
+        command = struct.pack("H", total_pages)
         packet = self._transceive(
-            RequestCodeEnum.START_PRINT, page_count_bytes + remaining_bytes
+            RequestCodeEnum.START_PRINT, b"\x00" + command + b"\x00\x00\x00\x00"
         )
         return bool(packet.data[0])
 
@@ -354,7 +350,7 @@ class PrinterClient:
 
     def get_print_status(self):
         packet = self._transceive(RequestCodeEnum.GET_PRINT_STATUS, b"\x01", 16)
-        finished = bool(packet.data[1])
-        progress = packet.data[2]
-        error = bool(packet.data[6])
-        return PrintStatus(finished, progress, error)
+
+        page, progress1, progress2 = struct.unpack(">HBB", packet.data)
+
+        return {"page": page, "progress1": progress1, "progress2": progress2}

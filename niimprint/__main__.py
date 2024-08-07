@@ -163,7 +163,7 @@ def print_cmd(
         image = generate_barcode_image(barcode, 40, 20, domain, include_id)
         if preview:
             save_and_open_image(image)
-            click.confirm("Contin/ue printing?", abort=True)
+            click.confirm("Continue printing?", abort=True)
     else:
         image = Image.open(image)
 
